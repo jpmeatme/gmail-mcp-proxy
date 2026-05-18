@@ -114,12 +114,38 @@ def well_known_auth_server():
         "issuer": BASE_URL,
         "authorization_endpoint": f"{BASE_URL}/oauth/authorize",
         "token_endpoint": f"{BASE_URL}/oauth/token",
+        "registration_endpoint": f"{BASE_URL}/register",
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
         "scopes_supported": ["mcp:read", "mcp:write"],
         "token_endpoint_auth_methods_supported": ["none"],
         "code_challenge_methods_supported": ["S256", "plain"],
     })
+
+
+# Dynamic Client Registration (RFC 7591) - required by opencode MCP SDK
+_registered_clients: dict[str, dict] = {}
+
+@app.post("/register")
+async def register_client(request: Request):
+    """Accept any client registration and return a client_id."""
+    body = await request.json()
+    client_id = secrets.token_urlsafe(16)
+    _registered_clients[client_id] = {
+        "redirect_uris": body.get("redirect_uris", []),
+        "client_name": body.get("client_name", "mcp-client"),
+        "grant_types": body.get("grant_types", ["authorization_code"]),
+        "response_types": body.get("response_types", ["code"]),
+        "token_endpoint_auth_method": body.get("token_endpoint_auth_method", "none"),
+    }
+    return JSONResponse({
+        "client_id": client_id,
+        "client_id_issued_at": int(__import__("time").time()),
+        "redirect_uris": _registered_clients[client_id]["redirect_uris"],
+        "grant_types": _registered_clients[client_id]["grant_types"],
+        "response_types": _registered_clients[client_id]["response_types"],
+        "token_endpoint_auth_method": _registered_clients[client_id]["token_endpoint_auth_method"],
+    }, status_code=201)
 
 
 # ── OAuth Flow: opencode → us → Google ───────────────────────────────────────
