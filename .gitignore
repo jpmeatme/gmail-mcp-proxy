@@ -1,0 +1,9 @@
+# Archivos secretos - NUNCA subir a GitHub
+client_secret.json
+token.json
+
+# Python
+venv/
+__pycache__/
+*.pyc
+.env

@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: gmail-mcp-proxy
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: BASE_URL
+        # Render sets RENDER_EXTERNAL_URL automatically, but we need it for OAuth.
+        # After your first deploy, copy the Render URL and update this value.
+        value: https://gmail-mcp-proxy.onrender.com  # ← Cambia esto a tu URL de Render
+      - key: REDIRECT_URI
+        value: https://gmail-mcp-proxy.onrender.com/callback  # ← Cambia esto también
+      - key: SESSION_SECRET
+        generateValue: true   # Render genera un valor aleatorio seguro automáticamente
+      - key: TOKEN_FILE
+        value: /tmp/token.json
+      - key: CLIENT_SECRETS_FILE
+        value: /tmp/client_secret.json
