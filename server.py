@@ -5,6 +5,8 @@ Bridges Umbral/OpenCode with Google's official Gmail MCP server.
 
 import os
 import json
+import hashlib
+import base64
 import secrets
 import tempfile
 import urllib.parse
@@ -116,7 +118,7 @@ def well_known_auth_server():
         "grant_types_supported": ["authorization_code"],
         "scopes_supported": ["mcp:read", "mcp:write"],
         "token_endpoint_auth_methods_supported": ["none"],
-        "code_challenge_methods_supported": [],
+        "code_challenge_methods_supported": ["S256"],
     })
 
 
@@ -142,11 +144,13 @@ async def register_client(request: Request):
 @app.get("/oauth/authorize")
 def oauth_authorize(request: Request):
     """
-    opencode redirects the user here. We build the Google auth URL manually
-    (without PKCE) so we don't need to track code_verifier across requests.
+    opencode redirects the user here with a code_challenge (PKCE S256).
+    We store it, then redirect to Google without PKCE.
     """
     redirect_uri_back = request.query_params.get("redirect_uri", "")
     mcp_state = request.query_params.get("state", "")
+    code_challenge = request.query_params.get("code_challenge", "")
+    code_challenge_method = request.query_params.get("code_challenge_method", "S256")
 
     if not os.path.exists(get_client_secrets_file()):
         return JSONResponse({"error": "Missing client_secret.json"}, status_code=500)
@@ -157,9 +161,11 @@ def oauth_authorize(request: Request):
     _pending_auth[internal_state] = {
         "redirect_uri": redirect_uri_back,
         "mcp_state": mcp_state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
     }
 
-    # Build URL manually — explicitly no code_challenge so no verifier needed
+    # Build URL manually — no code_challenge sent to Google (PKCE only between us and opencode)
     params = urllib.parse.urlencode({
         "client_id": client_config["client_id"],
         "redirect_uri": REDIRECT_URI,
@@ -221,6 +227,7 @@ def google_callback(request: Request, code: str = "", state: str = "", error: st
     _token_store[our_token] = {
         "google_token": access_token,
         "issued_at": datetime.utcnow().isoformat(),
+        "code_challenge": pending.get("code_challenge", "") if pending else "",
     }
 
     if pending and pending.get("redirect_uri"):
@@ -239,18 +246,29 @@ def google_callback(request: Request, code: str = "", state: str = "", error: st
 
 @app.post("/oauth/token")
 async def oauth_token(request: Request):
-    """Exchange authorization code for our access token."""
+    """Exchange authorization code for our access token, validating PKCE S256."""
     try:
         body = await request.form()
         code = body.get("code", "")
+        code_verifier = body.get("code_verifier", "")
     except Exception:
         raw = await request.body()
         body_dict = dict(urllib.parse.parse_qsl(raw.decode()))
         code = body_dict.get("code", "")
+        code_verifier = body_dict.get("code_verifier", "")
 
     our_token = _auth_codes.pop(code, None)
     if not our_token:
         return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
+    # Validate PKCE S256: sha256(code_verifier) == code_challenge
+    pending_challenge = _token_store.get(our_token, {}).get("code_challenge", "")
+    if pending_challenge and code_verifier:
+        computed = base64.urlsafe_b64encode(
+            hashlib.sha256(code_verifier.encode()).digest()
+        ).rstrip(b"=").decode()
+        if computed != pending_challenge:
+            return JSONResponse({"error": "invalid_grant", "detail": "PKCE mismatch"}, status_code=400)
 
     return JSONResponse({
         "access_token": our_token,
