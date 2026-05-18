@@ -186,20 +186,32 @@ def google_callback(request: Request, code: str = "", state: str = "", error: st
     if error:
         return JSONResponse({"error": f"Google OAuth error: {error}"}, status_code=400)
 
+    if not code:
+        return JSONResponse({"error": "Missing code parameter"}, status_code=400)
+
     pending = _pending_auth.pop(state, None)
 
-    flow = Flow.from_client_secrets_file(
-        get_client_secrets_file(), scopes=SCOPES, redirect_uri=REDIRECT_URI, state=state,
-    )
-    flow.fetch_token(authorization_response=str(request.url))
-    creds = flow.credentials
+    try:
+        os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+        flow = Flow.from_client_secrets_file(
+            get_client_secrets_file(), scopes=SCOPES, redirect_uri=REDIRECT_URI, state=state,
+        )
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+    except Exception as exc:
+        return JSONResponse({"error": f"Token exchange failed: {str(exc)}"}, status_code=500)
 
-    with open(TOKEN_FILE, "w") as f:
-        f.write(creds.to_json())
+    try:
+        with open(TOKEN_FILE, "w") as f:
+            f.write(creds.to_json())
+    except Exception:
+        pass
 
-    # Issue our own token
     our_token = secrets.token_urlsafe(32)
-    _token_store[our_token] = {"issued_at": datetime.utcnow().isoformat()}
+    _token_store[our_token] = {
+        "google_token": creds.token,
+        "issued_at": datetime.utcnow().isoformat(),
+    }
 
     if pending and pending.get("redirect_uri"):
         auth_code = secrets.token_urlsafe(16)
@@ -213,6 +225,7 @@ def google_callback(request: Request, code: str = "", state: str = "", error: st
         "message": "✅ Autenticación exitosa.",
         "sse_url": f"{BASE_URL}/sse",
     })
+
 
 
 @app.post("/oauth/token")
