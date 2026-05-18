@@ -8,8 +8,9 @@ Flow:
 
 import os
 import json
+import tempfile
 import asyncio
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse
 from starlette.middleware.sessions import SessionMiddleware
 import httpx
@@ -39,6 +40,25 @@ SCOPES = [
 
 TOKEN_FILE = os.getenv("TOKEN_FILE", "token.json")
 CLIENT_SECRETS_FILE = os.getenv("CLIENT_SECRETS_FILE", "client_secret.json")
+
+# Support for Render: load client secrets from env var
+_CLIENT_SECRETS_TMP = None
+
+def get_client_secrets_file() -> str:
+    """Return path to client_secret.json. If GOOGLE_CLIENT_SECRET_JSON env var
+    is set, write it to a temp file so google-auth-oauthlib can read it."""
+    global _CLIENT_SECRETS_TMP
+    secret_json = os.getenv("GOOGLE_CLIENT_SECRET_JSON")
+    if secret_json:
+        if _CLIENT_SECRETS_TMP is None:
+            tmp = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False
+            )
+            tmp.write(secret_json)
+            tmp.close()
+            _CLIENT_SECRETS_TMP = tmp.name
+        return _CLIENT_SECRETS_TMP
+    return CLIENT_SECRETS_FILE
 
 
 # ─── Gestión de Tokens ───────────────────────────────────────────────────────
@@ -90,13 +110,14 @@ def health():
 
 @app.get("/login")
 def login(request: Request):
-    if not os.path.exists(CLIENT_SECRETS_FILE):
+    secrets_file = get_client_secrets_file()
+    if not os.path.exists(secrets_file):
         return JSONResponse(
-            {"error": f"Falta {CLIENT_SECRETS_FILE}. Descárgalo de Google Cloud Console."},
+            {"error": "Falta client_secret.json o la variable GOOGLE_CLIENT_SECRET_JSON."},
             status_code=500,
         )
     flow = Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE, scopes=SCOPES, redirect_uri=REDIRECT_URI
+        secrets_file, scopes=SCOPES, redirect_uri=REDIRECT_URI
     )
     auth_url, state = flow.authorization_url(
         access_type="offline", prompt="consent", include_granted_scopes="true"
@@ -113,7 +134,7 @@ def callback(request: Request, code: str = "", state: str = "", error: str = "")
         return JSONResponse({"error": "OAuth state mismatch."}, status_code=400)
 
     flow = Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE,
+        get_client_secrets_file(),
         scopes=SCOPES,
         redirect_uri=REDIRECT_URI,
         state=state,
