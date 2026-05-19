@@ -293,27 +293,15 @@ def health():
     return {"ok": True}
 
 
-@app.get("/login")
-def login():
-    """Direct login fallback without opencode flow."""
-    if not os.path.exists(get_client_secrets_file()):
-        return JSONResponse({"error": "Missing client_secret.json"}, status_code=500)
-    client_config = load_client_config()
-    params = urllib.parse.urlencode({
-        "client_id": client_config["client_id"],
-        "redirect_uri": REDIRECT_URI,
-        "response_type": "code",
-        "scope": " ".join(SCOPES),
-        "state": "direct_login",
-        "access_type": "offline",
-        "prompt": "consent",
-    })
-    return RedirectResponse(url=f"{client_config['auth_uri']}?{params}")
 
+# ── MCP Proxy ─────────────────────────────────────────────────────────────────
+# Google's Gmail MCP uses old SSE transport:
+#   GET  /mcp/v1/sse               → SSE event stream (sends 'endpoint' event)
+#   POST /mcp/v1/messages?sessionId → send MCP messages
 
-# ── MCP Proxy (Streamable HTTP) ───────────────────────────────────────────────
-# Google's Gmail MCP uses Streamable HTTP: single URL, both GET and POST.
-# opencode uses the same protocol, so we just forward everything transparently.
+GOOGLE_SSE_URL = f"{GOOGLE_MCP_URL}/sse"
+GOOGLE_MESSAGES_URL = f"{GOOGLE_MCP_URL}/messages"
+
 
 def _unauthorized_response():
     return Response(
@@ -328,30 +316,38 @@ def _unauthorized_response():
 
 @app.get("/sse")
 async def proxy_sse_get(request: Request):
+    """Stream SSE from Google's /sse endpoint, rewriting endpoint URLs to our proxy."""
     google_token = resolve_google_token(request.headers.get("authorization"))
     if not google_token:
         return _unauthorized_response()
 
-    forward_headers = {"Authorization": f"Bearer {google_token}"}
-    accept = request.headers.get("accept", "text/event-stream")
-    forward_headers["Accept"] = accept
+    headers = {
+        "Authorization": f"Bearer {google_token}",
+        "Accept": "text/event-stream",
+    }
 
-    async def stream():
+    async def event_generator():
         async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream("GET", GOOGLE_MCP_URL, headers=forward_headers) as resp:
-                async for chunk in resp.aiter_bytes():
-                    yield chunk
+            async with client.stream("GET", GOOGLE_SSE_URL, headers=headers) as resp:
+                if resp.status_code != 200:
+                    yield f"data: {{\"error\": \"Google SSE returned {resp.status_code}\"}}\n\n"
+                    return
+                async for line in resp.aiter_lines():
+                    # Rewrite Google's message endpoint URL → our /messages proxy
+                    if "gmailmcp.googleapis.com" in line:
+                        line = line.replace(GOOGLE_MCP_URL, BASE_URL)
+                    yield line + "\n"
 
     return StreamingResponse(
-        stream(),
+        event_generator(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
-@app.post("/")
 @app.post("/messages")
 async def proxy_messages(request: Request):
+    """Forward MCP messages to Google's /messages endpoint (with sessionId)."""
     google_token = resolve_google_token(request.headers.get("authorization"))
     if not google_token:
         return _unauthorized_response()
@@ -362,11 +358,15 @@ async def proxy_messages(request: Request):
         "Content-Type": request.headers.get("content-type", "application/json"),
         "Accept": request.headers.get("accept", "application/json"),
     }
-    if "mcp-session-id" in request.headers:
-        forward_headers["mcp-session-id"] = request.headers["mcp-session-id"]
+
+    # Preserve sessionId query param (required by Google's SSE transport)
+    session_id = request.query_params.get("sessionId")
+    url = GOOGLE_MESSAGES_URL
+    if session_id:
+        url = f"{url}?sessionId={session_id}"
 
     async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(GOOGLE_MCP_URL, content=body, headers=forward_headers)
+        resp = await client.post(url, content=body, headers=forward_headers)
     return Response(
         content=resp.content,
         status_code=resp.status_code,
@@ -374,43 +374,12 @@ async def proxy_messages(request: Request):
     )
 
 
+@app.post("/")
 @app.post("/sse")
 async def proxy_sse_post(request: Request):
-    google_token = resolve_google_token(request.headers.get("authorization"))
-    if not google_token:
-        return _unauthorized_response()
-
-    body = await request.body()
-    forward_headers = {
-        "Authorization": f"Bearer {google_token}",
-        "Content-Type": request.headers.get("content-type", "application/json"),
-        "Accept": request.headers.get("accept", "application/json"),
-    }
-    # Forward MCP session ID if present
-    if "mcp-session-id" in request.headers:
-        forward_headers["mcp-session-id"] = request.headers["mcp-session-id"]
-
-    accept = forward_headers["Accept"]
-    if "text/event-stream" in accept:
-        # Client wants SSE streaming response
-        async def stream():
-            async with httpx.AsyncClient(timeout=None) as client:
-                async with client.stream("POST", GOOGLE_MCP_URL, content=body, headers=forward_headers) as resp:
-                    async for chunk in resp.aiter_bytes():
-                        yield chunk
-
-        return StreamingResponse(stream(), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-    else:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(GOOGLE_MCP_URL, content=body, headers=forward_headers)
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            media_type=resp.headers.get("content-type", "application/json"),
-        )
+    """Handle POST to /sse or / — forward to Google's messages endpoint."""
+    return await proxy_messages(request)
 
 
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=True)
-
