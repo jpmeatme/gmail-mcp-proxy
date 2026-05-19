@@ -328,10 +328,26 @@ def _unauthorized_response():
 
 @app.get("/sse")
 async def proxy_sse_get(request: Request):
-    """Stream SSE from Google's Streamable HTTP endpoint."""
+    """
+    Stream SSE from Google's Streamable HTTP endpoint.
+    If no token: keep SSE connection alive (no events) so EventSource doesn't error.
+    OAuth is triggered via POST /sse which returns 401 + WWW-Authenticate properly.
+    """
     google_token = resolve_google_token(request.headers.get("authorization"))
+
     if not google_token:
-        return _unauthorized_response()
+        # Return a keep-alive SSE stream — EventSource can't read 401 headers
+        # and fires 'SSE error: undefined'. OAuth is handled via POST instead.
+        async def keepalive():
+            while True:
+                yield ": keepalive\n\n"
+                await asyncio.sleep(15)
+
+        return StreamingResponse(
+            keepalive(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     headers = {
         "Authorization": f"Bearer {google_token}",
