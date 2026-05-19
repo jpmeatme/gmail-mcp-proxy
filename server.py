@@ -164,6 +164,8 @@ def oauth_authorize(request: Request):
         "code_challenge": code_challenge,
         "code_challenge_method": code_challenge_method,
     }
+    # Also persist in session cookie so it survives server restarts
+    request.session[f"pending_{internal_state}"] = _pending_auth[internal_state]
 
     # Build URL manually — no code_challenge sent to Google (PKCE only between us and opencode)
     params = urllib.parse.urlencode({
@@ -189,6 +191,11 @@ def google_callback(request: Request, code: str = "", state: str = "", error: st
         return JSONResponse({"error": "Missing code parameter"}, status_code=400)
 
     pending = _pending_auth.pop(state, None)
+    # Fallback: recover from session cookie if server restarted and cleared _pending_auth
+    if not pending:
+        pending = request.session.pop(f"pending_{state}", None)
+    else:
+        request.session.pop(f"pending_{state}", None)  # clean up session too
 
     # Exchange code for Google token via raw HTTP (no PKCE verifier needed)
     try:
