@@ -178,6 +178,8 @@ def oauth_authorize(request: Request):
         "prompt": "consent",
         "include_granted_scopes": "true",
     })
+    print(f"[AUTHORIZE] mcp_state={mcp_state!r} redirect_uri={redirect_uri_back!r} code_challenge={code_challenge[:10] if code_challenge else '(none)'}...")
+    print(f"[AUTHORIZE] internal_state={internal_state!r}")
     auth_url = f"{client_config['auth_uri']}?{params}"
     return RedirectResponse(url=auth_url)
 
@@ -190,12 +192,17 @@ def google_callback(request: Request, code: str = "", state: str = "", error: st
     if not code:
         return JSONResponse({"error": "Missing code parameter"}, status_code=400)
 
+    print(f"[CALLBACK] state={state!r} code={'yes' if code else 'no'}")
     pending = _pending_auth.pop(state, None)
+    print(f"[CALLBACK] pending from _pending_auth: {'yes' if pending else 'no'}")
     # Fallback: recover from session cookie if server restarted and cleared _pending_auth
     if not pending:
         pending = request.session.pop(f"pending_{state}", None)
+        print(f"[CALLBACK] pending from session cookie: {'yes' if pending else 'NO - LOST!'}")
     else:
         request.session.pop(f"pending_{state}", None)  # clean up session too
+    if pending:
+        print(f"[CALLBACK] redirect_uri={pending.get('redirect_uri')!r} mcp_state={pending.get('mcp_state')!r}")
 
     # Exchange code for Google token via raw HTTP (no PKCE verifier needed)
     try:
@@ -243,6 +250,7 @@ def google_callback(request: Request, code: str = "", state: str = "", error: st
         redirect_uri = pending["redirect_uri"]
         mcp_state = pending.get("mcp_state", "")
         sep = "&" if "?" in redirect_uri else "?"
+        print(f"[CALLBACK] redirecting back to opencode: {redirect_uri!r} state={mcp_state!r}")
         return RedirectResponse(url=f"{redirect_uri}{sep}code={auth_code}&state={mcp_state}")
 
     return JSONResponse({
