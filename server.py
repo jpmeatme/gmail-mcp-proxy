@@ -349,6 +349,31 @@ async def proxy_sse_get(request: Request):
     )
 
 
+@app.post("/")
+@app.post("/messages")
+async def proxy_messages(request: Request):
+    google_token = resolve_google_token(request.headers.get("authorization"))
+    if not google_token:
+        return _unauthorized_response()
+
+    body = await request.body()
+    forward_headers = {
+        "Authorization": f"Bearer {google_token}",
+        "Content-Type": request.headers.get("content-type", "application/json"),
+        "Accept": request.headers.get("accept", "application/json"),
+    }
+    if "mcp-session-id" in request.headers:
+        forward_headers["mcp-session-id"] = request.headers["mcp-session-id"]
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(GOOGLE_MCP_URL, content=body, headers=forward_headers)
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/json"),
+    )
+
+
 @app.post("/sse")
 async def proxy_sse_post(request: Request):
     google_token = resolve_google_token(request.headers.get("authorization"))
