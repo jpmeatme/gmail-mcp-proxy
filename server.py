@@ -358,7 +358,11 @@ async def proxy_sse_get(request: Request):
         async with httpx.AsyncClient(timeout=None) as client:
             async with client.stream("GET", GOOGLE_MCP_URL, headers=headers) as resp:
                 if resp.status_code not in (200, 204):
-                    yield f'data: {{"error": "Google returned {resp.status_code}"}}\n\n'
+                    # Google's Streamable HTTP endpoint doesn't support GET (405).
+                    # Keep the SSE connection alive silently — MCP data flows via POST.
+                    while True:
+                        yield ": keepalive\n\n"
+                        await asyncio.sleep(15)
                     return
                 async for line in resp.aiter_lines():
                     yield line + "\n"
