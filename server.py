@@ -295,12 +295,9 @@ def health():
 
 
 # ── MCP Proxy ─────────────────────────────────────────────────────────────────
-# Google's Gmail MCP uses old SSE transport:
-#   GET  /mcp/v1/sse               → SSE event stream (sends 'endpoint' event)
-#   POST /mcp/v1/messages?sessionId → send MCP messages
-
-GOOGLE_SSE_URL = f"{GOOGLE_MCP_URL}/sse"
-GOOGLE_MESSAGES_URL = f"{GOOGLE_MCP_URL}/messages"
+# Google's Gmail MCP uses Streamable HTTP at base URL (no /sse or /messages subpaths)
+# GET /mcp/v1  → SSE stream for server-initiated events
+# POST /mcp/v1 → send MCP messages, get JSON or SSE response
 
 
 def _unauthorized_response():
@@ -316,7 +313,7 @@ def _unauthorized_response():
 
 @app.get("/sse")
 async def proxy_sse_get(request: Request):
-    """Stream SSE from Google's /sse endpoint, rewriting endpoint URLs to our proxy."""
+    """Stream SSE from Google's Streamable HTTP endpoint."""
     google_token = resolve_google_token(request.headers.get("authorization"))
     if not google_token:
         return _unauthorized_response()
@@ -328,14 +325,11 @@ async def proxy_sse_get(request: Request):
 
     async def event_generator():
         async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream("GET", GOOGLE_SSE_URL, headers=headers) as resp:
-                if resp.status_code != 200:
-                    yield f"data: {{\"error\": \"Google SSE returned {resp.status_code}\"}}\n\n"
+            async with client.stream("GET", GOOGLE_MCP_URL, headers=headers) as resp:
+                if resp.status_code not in (200, 204):
+                    yield f'data: {{"error": "Google returned {resp.status_code}"}}\n\n'
                     return
                 async for line in resp.aiter_lines():
-                    # Rewrite Google's message endpoint URL → our /messages proxy
-                    if "gmailmcp.googleapis.com" in line:
-                        line = line.replace(GOOGLE_MCP_URL, BASE_URL)
                     yield line + "\n"
 
     return StreamingResponse(
@@ -347,7 +341,7 @@ async def proxy_sse_get(request: Request):
 
 @app.post("/messages")
 async def proxy_messages(request: Request):
-    """Forward MCP messages to Google's /messages endpoint (with sessionId)."""
+    """Forward MCP messages to Google's Streamable HTTP endpoint."""
     google_token = resolve_google_token(request.headers.get("authorization"))
     if not google_token:
         return _unauthorized_response()
@@ -356,17 +350,21 @@ async def proxy_messages(request: Request):
     forward_headers = {
         "Authorization": f"Bearer {google_token}",
         "Content-Type": request.headers.get("content-type", "application/json"),
-        "Accept": request.headers.get("accept", "application/json"),
+        "Accept": request.headers.get("accept", "application/json, text/event-stream"),
     }
 
-    # Preserve sessionId query param (required by Google's SSE transport)
-    session_id = request.query_params.get("sessionId")
-    url = GOOGLE_MESSAGES_URL
-    if session_id:
-        url = f"{url}?sessionId={session_id}"
+    accept = forward_headers["Accept"]
+    if "text/event-stream" in accept:
+        async def stream():
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("POST", GOOGLE_MCP_URL, content=body, headers=forward_headers) as resp:
+                    async for chunk in resp.aiter_bytes():
+                        yield chunk
+        return StreamingResponse(stream(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(url, content=body, headers=forward_headers)
+        resp = await client.post(GOOGLE_MCP_URL, content=body, headers=forward_headers)
     return Response(
         content=resp.content,
         status_code=resp.status_code,
