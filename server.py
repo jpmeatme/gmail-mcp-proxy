@@ -311,64 +311,81 @@ def login():
     return RedirectResponse(url=f"{client_config['auth_uri']}?{params}")
 
 
-# ── MCP Proxy ─────────────────────────────────────────────────────────────────
+# ── MCP Proxy (Streamable HTTP) ───────────────────────────────────────────────
+# Google's Gmail MCP uses Streamable HTTP: single URL, both GET and POST.
+# opencode uses the same protocol, so we just forward everything transparently.
+
+def _unauthorized_response():
+    return Response(
+        status_code=401,
+        headers={
+            "WWW-Authenticate": (
+                f'Bearer resource_metadata="{BASE_URL}/.well-known/oauth-protected-resource"'
+            ),
+        },
+    )
+
 
 @app.get("/sse")
-async def proxy_sse(request: Request):
+async def proxy_sse_get(request: Request):
     google_token = resolve_google_token(request.headers.get("authorization"))
     if not google_token:
-        return Response(
-            status_code=401,
-            headers={
-                "WWW-Authenticate": (
-                    f'Bearer resource_metadata="{BASE_URL}/.well-known/oauth-protected-resource"'
-                ),
-            },
-        )
+        return _unauthorized_response()
 
-    headers = {"Authorization": f"Bearer {google_token}", "Accept": "text/event-stream"}
+    forward_headers = {"Authorization": f"Bearer {google_token}"}
+    accept = request.headers.get("accept", "text/event-stream")
+    forward_headers["Accept"] = accept
 
-    async def event_generator():
+    async def stream():
         async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream("GET", f"{GOOGLE_MCP_URL}/sse", headers=headers) as resp:
-                async for line in resp.aiter_lines():
-                    if "gmailmcp.googleapis.com" in line:
-                        line = line.replace(GOOGLE_MCP_URL, BASE_URL)
-                    yield line + "\n"
+            async with client.stream("GET", GOOGLE_MCP_URL, headers=forward_headers) as resp:
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
 
     return StreamingResponse(
-        event_generator(),
+        stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
-@app.post("/messages")
-async def proxy_messages(request: Request):
-    google_token = resolve_google_token(request.headers.get("authorization")) or get_google_token()
-    if not google_token:
-        return JSONResponse({"error": "Not authenticated. Visit /login first."}, status_code=401)
-
-    body = await request.body()
-    headers = {
-        "Authorization": f"Bearer {google_token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(f"{GOOGLE_MCP_URL}/messages", content=body, headers=headers)
-
-    return Response(
-        content=resp.content,
-        status_code=resp.status_code,
-        media_type=resp.headers.get("content-type", "application/json"),
-    )
-
-
 @app.post("/sse")
 async def proxy_sse_post(request: Request):
-    return await proxy_messages(request)
+    google_token = resolve_google_token(request.headers.get("authorization"))
+    if not google_token:
+        return _unauthorized_response()
+
+    body = await request.body()
+    forward_headers = {
+        "Authorization": f"Bearer {google_token}",
+        "Content-Type": request.headers.get("content-type", "application/json"),
+        "Accept": request.headers.get("accept", "application/json"),
+    }
+    # Forward MCP session ID if present
+    if "mcp-session-id" in request.headers:
+        forward_headers["mcp-session-id"] = request.headers["mcp-session-id"]
+
+    accept = forward_headers["Accept"]
+    if "text/event-stream" in accept:
+        # Client wants SSE streaming response
+        async def stream():
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("POST", GOOGLE_MCP_URL, content=body, headers=forward_headers) as resp:
+                    async for chunk in resp.aiter_bytes():
+                        yield chunk
+
+        return StreamingResponse(stream(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    else:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(GOOGLE_MCP_URL, content=body, headers=forward_headers)
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            media_type=resp.headers.get("content-type", "application/json"),
+        )
 
 
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=True)
+
